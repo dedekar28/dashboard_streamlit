@@ -220,6 +220,14 @@ freq = freq_map[freq_label]
 roll_window = st.sidebar.number_input("Rolling window (periode)", min_value=1, value=3, step=1)
 clip_outliers = st.sidebar.toggle("Kurangi outlier ekstrem (IQR winsorize)", value=False)
 
+st.sidebar.markdown("### 📋 Contoh Syntax Input Dataset")
+st.sidebar.code(
+    "import pandas as pd\n"
+    "df = pd.read_csv('nama_file.csv')  # Untuk file CSV\n"
+    "df = pd.read_excel('nama_file.xlsx')  # Untuk file Excel",
+    language="python"
+)
+
 # ====== MAIN ======
 st.title("🫧 Dashboard Kualitas Udara — Analisis Deskriptif & Tren")
 st.caption("Upload dataset Anda (atau gunakan contoh). Pilih kolom tanggal & polutan di sidebar. Dashboard ini akan menghitung statistik deskriptif (mean, median, std, min/max) serta memvisualisasikan tren harian/bulanan/tahunan.")
