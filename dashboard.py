@@ -193,14 +193,8 @@ def download_csv_button(df: pd.DataFrame, filename: str, label: str):
 # ====== SIDEBAR ======
 st.sidebar.title("⚙️ Pengaturan")
 
-uploaded = st.sidebar.file_uploader("Upload dataset (CSV/XLSX)", type=["csv", "xlsx", "xls"])
-use_sample = st.sidebar.toggle("Gunakan contoh data", value=True if uploaded is None else False)
-
-raw_df = load_data(uploaded) if uploaded is not None else (make_sample_data() if use_sample else pd.DataFrame())
-
-if raw_df.empty:
-    st.info("Silakan upload file CSV/Excel atau aktifkan \"Gunakan contoh data\" di sidebar.")
-    st.stop()
+# Remove file upload section and always use sample data
+raw_df = make_sample_data()
 
 # pilih kolom tanggal & polutan
 dt_guess = find_datetime_col(raw_df)
@@ -230,7 +224,7 @@ st.sidebar.code(
 
 # ====== MAIN ======
 st.title("🫧 Dashboard Kualitas Udara — Analisis Deskriptif & Tren")
-st.caption("Upload dataset Anda (atau gunakan contoh). Pilih kolom tanggal & polutan di sidebar. Dashboard ini akan menghitung statistik deskriptif (mean, median, std, min/max) serta memvisualisasikan tren harian/bulanan/tahunan.")
+st.caption("Dashboard ini menggunakan data sampel untuk menghitung statistik deskriptif (mean, median, std, min/max) serta memvisualisasikan tren harian/bulanan/tahunan.")
 
 with st.expander("🔎 Pratinjau Data", expanded=False):
     st.write(raw_df.head(20))
