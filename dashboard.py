@@ -190,6 +190,31 @@ def download_csv_button(df: pd.DataFrame, filename: str, label: str):
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button(label=label, data=csv, file_name=filename, mime="text/csv")
 
+def get_datetime_candidates(df: pd.DataFrame) -> list[str]:
+    """Return list of columns that are potential datetime columns."""
+    candidates = []
+    
+    # 1. Check columns with datetime dtype
+    dt_cols = [c for c in df.columns if np.issubdtype(df[c].dtype, np.datetime64)]
+    candidates.extend(dt_cols)
+    
+    # 2. Check columns with common datetime names
+    lower_map = {c.lower(): c for c in df.columns}
+    for key in COMMON_DATE_COLS:
+        if key in lower_map and lower_map[key] not in candidates:
+            candidates.append(lower_map[key])
+    
+    # 3. Try parsing other string columns
+    for c in df.columns:
+        if c not in candidates:
+            try:
+                pd.to_datetime(df[c], errors='raise')
+                candidates.append(c)
+            except (ValueError, TypeError):
+                continue
+    
+    return candidates
+
 # ====== SIDEBAR ======
 st.sidebar.title("⚙️ Pengaturan")
 
@@ -197,8 +222,17 @@ st.sidebar.title("⚙️ Pengaturan")
 raw_df = make_sample_data()
 
 # pilih kolom tanggal & polutan
+dt_candidates = get_datetime_candidates(raw_df)
+if not dt_candidates:
+    st.error("Tidak ada kolom datetime yang terdeteksi dalam dataset")
+    st.stop()
+
 dt_guess = find_datetime_col(raw_df)
-dt_col = st.sidebar.selectbox("Kolom tanggal/waktu", options=list(raw_df.columns), index=(list(raw_df.columns).index(dt_guess) if dt_guess in raw_df.columns else 0))
+dt_col = st.sidebar.selectbox(
+    "Kolom tanggal/waktu",
+    options=dt_candidates,
+    index=dt_candidates.index(dt_guess) if dt_guess in dt_candidates else 0
+)
 
 pollutant_guess = auto_pollutant_cols(raw_df, dt_guess)
 pollutant_cols = st.sidebar.multiselect(
