@@ -1,173 +1,356 @@
-import streamlit as st
-import pandas as pd
+# Streamlit Dashboard Sederhana: Analisis Kualitas Udara
+# Jalankan lokal:  
+# 1) Buat/aktifkan venv (opsional)  
+# 2) pip install -r requirements.txt  
+# 3) streamlit run streamlit_air_quality_dashboard.py
+
+# ====== IMPORTS ======
+import io
+from datetime import timedelta
+
 import numpy as np
+import pandas as pd
 import plotly.express as px
-from datetime import datetime, timedelta
+import streamlit as st
 
-# Judul dashboard
-st.title('Dashboard Analisis Kualitas Udara')
-st.markdown('Analisis polutan utama dan tren kualitas udara berdasarkan dataset main_data.csv')
-st.markdown('---')
+# ====== PAGE CONFIG ======
+st.set_page_config(
+    page_title="Dashboard Kualitas Udara",
+    page_icon="🫧",
+    layout="wide",
+)
 
-# Load data dari main_data.csv
-@st.cache_data
-def load_data():
-    try:
-        data = pd.read_csv('PRSA_Data_Dongsi_20130301-20170228.csv')
-        st.success("✅ Data berhasil dimuat dari PRSA_Data_Dongsi_20130301-20170228.csv")
-        
-        # Convert kolom timestamp jika ada
-        timestamp_cols = ['timestamp', 'date', 'time', 'datetime', 'tanggal']
-        for col in timestamp_cols:
-            if col in data.columns:
-                data[col] = pd.to_datetime(data[col])
-                break
-        
-        return data
-    except FileNotFoundError:
-        st.error("❌ File main_data.csv tidak ditemukan. Pastikan file berada di direktori yang sama.")
+# ====== UTILS ======
+COMMON_DATE_COLS = [
+    "datetime", "timestamp", "date", "time", "waktu", "tanggal",
+]
+COMMON_POLLUTANTS = [
+    "PM2.5", "PM25", "PM_2_5", "PM10", "SO2", "NO2", "CO", "O3", "NH3", "H2S",
+]
+
+@st.cache_data(show_spinner=False)
+def load_data(uploaded_file: io.BytesIO) -> pd.DataFrame:
+    """Load CSV/XLSX to DataFrame with best-effort datetime parsing."""
+    if uploaded_file is None:
         return pd.DataFrame()
-    except Exception as e:
-        st.error(f"❌ Error loading data: {str(e)}")
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+    elif name.endswith(".xlsx") or name.endswith(".xls"):
+        df = pd.read_excel(uploaded_file)
+    else:
+        st.error("Format file tidak didukung. Gunakan CSV atau Excel.")
         return pd.DataFrame()
+    return df
 
-# Memuat data
-data = load_data()
+@st.cache_data(show_spinner=False)
+def make_sample_data(n_days: int = 120, freq: str = "H", seed: int = 7) -> pd.DataFrame:
+    """Generate contoh data kualitas udara untuk uji dashboard."""
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range(pd.Timestamp.today().normalize() - pd.Timedelta(days=n_days), periods=n_days * (24 if freq == "H" else 1), freq=freq)
+    base = np.linspace(0, 1, len(idx))
+    df = pd.DataFrame({
+        "timestamp": idx,
+        "PM2.5": 35 + 10*np.sin(2*np.pi*base*3) + rng.normal(0, 5, len(idx)),
+        "PM10": 60 + 12*np.cos(2*np.pi*base*2) + rng.normal(0, 7, len(idx)),
+        "SO2": 12 + 3*np.sin(2*np.pi*base*1.5) + rng.normal(0, 1.5, len(idx)),
+        "NO2": 25 + 6*np.cos(2*np.pi*base*1.2) + rng.normal(0, 2.5, len(idx)),
+        "CO": 0.9 + 0.2*np.sin(2*np.pi*base*4) + rng.normal(0, 0.08, len(idx)),
+        "O3": 40 + 8*np.sin(2*np.pi*base*0.8) + rng.normal(0, 3, len(idx)),
+    })
+    # pastikan tidak ada negatif
+    for c in df.columns:
+        if c != "timestamp":
+            df[c] = df[c].clip(lower=0)
+    return df
 
-if data.empty:
-    st.warning("Tidak ada data yang dapat dimuat. Dashboard tidak dapat dilanjutkan.")
+
+def find_datetime_col(df: pd.DataFrame) -> str | None:
+    if df.empty:
+        return None
+    # 1) dtype datetime dulu
+    dt_cols = [c for c in df.columns if np.issubdtype(df[c].dtype, np.datetime64)]
+    if dt_cols:
+        return dt_cols[0]
+    # 2) nama umum
+    lower_map = {c.lower(): c for c in df.columns}
+    for key in COMMON_DATE_COLS:
+        if key in lower_map:
+            return lower_map[key]
+    # 3) coba parse kolom pertama yang bisa di-parse
+    for c in df.columns:
+        try:
+            _ = pd.to_datetime(df[c], errors="raise")
+            return c
+        except Exception:
+            continue
+    return None
+
+
+def auto_pollutant_cols(df: pd.DataFrame, dt_col: str | None) -> list[str]:
+    if df.empty:
+        return []
+    candidates = []
+    # 1) nama umum
+    lower_map = {c.lower(): c for c in df.columns}
+    for key in COMMON_POLLUTANTS:
+        if key.lower() in lower_map:
+            candidates.append(lower_map[key.lower()])
+    # 2) semua kolom numerik selain datetime
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if dt_col in numeric_cols:
+        numeric_cols.remove(dt_col)
+    # gabung, pertahankan urutan dan unik
+    seen = set()
+    result = []
+    for c in candidates + numeric_cols:
+        if c not in seen:
+            seen.add(c)
+            result.append(c)
+    return result
+
+
+def robust_clip(df: pd.DataFrame, cols: list[str], iqr_mult: float = 3.0) -> pd.DataFrame:
+    """Winsorize sederhana berbasis IQR untuk mengurangi outlier ekstrem."""
+    dfc = df.copy()
+    for c in cols:
+        q1 = dfc[c].quantile(0.25)
+        q3 = dfc[c].quantile(0.75)
+        iqr = q3 - q1
+        low = q1 - iqr_mult * iqr
+        high = q3 + iqr_mult * iqr
+        dfc[c] = dfc[c].clip(lower=low, upper=high)
+    return dfc
+
+
+def descriptive_stats(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    if not cols:
+        return pd.DataFrame()
+    agg = df[cols].agg(["mean", "median", "std", "min", "max", "count"]).T
+    agg.rename(columns={
+        "mean": "Mean",
+        "median": "Median",
+        "std": "StdDev",
+        "min": "Min",
+        "max": "Max",
+        "count": "N",
+    }, inplace=True)
+    # tambahkan Missing
+    agg["Missing"] = df.shape[0] - agg["N"].astype(int)
+    return agg
+
+
+def resample_df(df: pd.DataFrame, dt_col: str, cols: list[str], freq: str) -> pd.DataFrame:
+    tmp = df[[dt_col] + cols].copy()
+    tmp[dt_col] = pd.to_datetime(tmp[dt_col], errors="coerce")
+    tmp = tmp.dropna(subset=[dt_col])
+    tmp = tmp.sort_values(dt_col)
+    tmp = tmp.set_index(dt_col)
+    # gunakan mean per periode
+    out = tmp.resample(freq).mean(numeric_only=True)
+    out.index.name = dt_col
+    return out.reset_index()
+
+
+def trend_summary(df_r: pd.DataFrame, dt_col: str, cols: list[str]) -> pd.DataFrame:
+    rows = []
+    if df_r.empty or len(df_r) < 2:
+        return pd.DataFrame(rows)
+    # ordinal time untuk slope
+    t0 = df_r[dt_col].min()
+    t_ord = (df_r[dt_col] - t0).dt.total_seconds() / (24*3600)  # hari
+
+    for c in cols:
+        series = df_r[c].astype(float)
+        if series.dropna().shape[0] < 2:
+            continue
+        # slope (unit per hari)
+        try:
+            slope, intercept = np.polyfit(t_ord[series.notna()], series.dropna(), 1)
+        except Exception:
+            slope, intercept = np.nan, np.nan
+        first = series.iloc[0]
+        last = series.iloc[-1]
+        pct_change = (last - first) / first * 100 if pd.notna(first) and first != 0 else np.nan
+        direction = "Naik" if pct_change > 0 else ("Turun" if pct_change < 0 else "Stagnan")
+        rows.append({
+            "Polutan": c,
+            "Rata-rata": series.mean(),
+            "Median": series.median(),
+            "Slope_per_hari": slope,
+            "%Perubahan (first→last)": pct_change,
+            "Arah": direction,
+        })
+    return pd.DataFrame(rows)
+
+
+def download_csv_button(df: pd.DataFrame, filename: str, label: str):
+    if df is None or df.empty:
+        return
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button(label=label, data=csv, file_name=filename, mime="text/csv")
+
+def format_datetime_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Format timestamps into readable date and time columns."""
+    datetime_cols = [c for c in df.columns if np.issubdtype(df[c].dtype, np.datetime64)]
+    date_pattern_cols = [c for c in df.columns if any(pat in c.lower() for pat in ['date', 'time', 'timestamp'])]
+    
+    # Try to format any potential datetime columns
+    for col in datetime_cols + date_pattern_cols:
+        try:
+            # Convert to datetime if not already
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+            # Create formatted date and time columns
+            new_col_name = col.replace('timestamp', 'waktu').replace('datetime', 'waktu')
+            df[f'{new_col_name}_tanggal'] = df[col].dt.strftime('%Y-%m-%d')
+            df[f'{new_col_name}_jam'] = df[col].dt.strftime('%H:%M:%S')
+        except:
+            continue
+    
+    return df
+
+# ====== SIDEBAR ======
+st.sidebar.title("⚙️ Pengaturan")
+
+uploaded = st.sidebar.file_uploader("Upload dataset (CSV/XLSX)", type=["csv", "xlsx", "xls"])
+use_sample = st.sidebar.toggle("Gunakan contoh data", value=True if uploaded is None else False)
+
+raw_df = load_data(uploaded) if uploaded is not None else (make_sample_data() if use_sample else pd.DataFrame())
+
+if raw_df.empty:
+    st.info("Silakan upload file CSV/Excel atau aktifkan \"Gunakan contoh data\" di sidebar.")
     st.stop()
 
-# Sidebar untuk informasi dataset
-st.sidebar.header('Informasi Dataset')
-st.sidebar.write(f"Jumlah baris: {data.shape[0]}")
-st.sidebar.write(f"Jumlah kolom: {data.shape[1]}")
-st.sidebar.write(f"Periode data: {data.iloc[0,0]} hingga {data.iloc[-1,0]}" if 'timestamp' in data.columns else "Tidak ada kolom timestamp")
+# ====== DATETIME SELECTION ======
+raw_df = format_datetime_cols(raw_df)
 
-# Identifikasi kolom
-numeric_columns = data.select_dtypes(include=[np.number]).columns.tolist()
-datetime_columns = data.select_dtypes(include=[np.datetime64]).columns.tolist()
-timestamp_col = datetime_columns[0] if datetime_columns else None
+# Update datetime column detection
+dt_candidates = [col for col in raw_df.columns if 'tanggal' in col.lower() or 'waktu' in col.lower()]
+if not dt_candidates:
+    st.error("Tidak ditemukan kolom tanggal/waktu yang valid.")
+    st.stop()
 
-# Sidebar untuk filter
-st.sidebar.header('Filter Data')
-selected_pollutant = st.sidebar.selectbox('Pilih Polutan', numeric_columns)
+# Get datetime guess first
+dt_guess = find_datetime_col(raw_df)
 
-# Tampilkan preview data
-st.header('Preview Data')
-st.write("5 baris pertama dari main_data.csv:")
-st.dataframe(data.head())
+dt_col = st.sidebar.selectbox(
+    "Kolom tanggal/waktu",
+    options=dt_candidates,
+    index=dt_candidates.index(dt_guess) if dt_guess in dt_candidates else 0,
+    help="Pilih kolom yang berisi informasi tanggal"
+)
 
-# Statistik deskriptif
-st.header('📊 Statistik Deskriptif Polutan')
+# pilih kolom tanggal & polutan
+pollutant_guess = auto_pollutant_cols(raw_df, dt_col)  # Changed from dt_guess to dt_col
+pollutant_cols = st.sidebar.multiselect(
+    "Pilih kolom polutan",
+    options=[c for c in raw_df.columns if c != dt_col],
+    default=pollutant_guess[:5] if pollutant_guess else [],
+)
 
-# Statistik untuk polutan terpilih
-st.subheader(f'Statistik untuk {selected_pollutant}')
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.metric("Rata-rata", f"{data[selected_pollutant].mean():.2f}")
-with col2:
-    st.metric("Median", f"{data[selected_pollutant].median():.2f}")
-with col3:
-    st.metric("Std Dev", f"{data[selected_pollutant].std():.2f}")
-with col4:
-    st.metric("Range", f"{data[selected_pollutant].min():.2f} - {data[selected_pollutant].max():.2f}")
+freq_label = st.sidebar.selectbox("Agregasi Tren", options=["Harian", "Bulanan", "Tahunan"], index=1)
+freq_map = {"Harian": "D", "Bulanan": "MS", "Tahunan": "YS"}
+freq = freq_map[freq_label]
 
-# Tabel statistik lengkap
-st.subheader('Statistik Lengkap Semua Polutan')
-stats_all = data[numeric_columns].describe().round(3)
-st.dataframe(stats_all)
+roll_window = st.sidebar.number_input("Rolling window (periode)", min_value=1, value=3, step=1)
+clip_outliers = st.sidebar.toggle("Kurangi outlier ekstrem (IQR winsorize)", value=False)
 
-# Analisis polutan utama
-st.header('🥇 Polutan Utama')
-pollutant_means = data[numeric_columns].mean().sort_values(ascending=False)
+# ====== MAIN ======
+st.title("🫧 Dashboard Kualitas Udara — Analisis Deskriptif & Tren")
+st.caption("Upload dataset Anda (atau gunakan contoh). Pilih kolom tanggal & polutan di sidebar. Dashboard ini akan menghitung statistik deskriptif (mean, median, std, min/max) serta memvisualisasikan tren harian/bulanan/tahunan.")
 
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader('Rata-rata Konsentrasi')
-    for i, (pollutant, value) in enumerate(pollutant_means.items()):
-        st.write(f"{i+1}. {pollutant}: {value:.2f}")
+with st.expander("🔎 Pratinjau Data", expanded=False):
+    # Reorder columns to show date and time first
+    display_cols = [c for c in raw_df.columns if 'tanggal' in c.lower() or 'jam' in c.lower()]
+    other_cols = [c for c in raw_df.columns if c not in display_cols]
+    st.dataframe(raw_df[display_cols + other_cols].head(20))
 
-with col2:
-    fig_bar = px.bar(x=pollutant_means.index, y=pollutant_means.values,
-                    labels={'x': 'Polutan', 'y': 'Rata-rata Konsentrasi'},
-                    title='Rata-rata Konsentrasi Polutan')
-    st.plotly_chart(fig_bar)
+# pembersihan dasar
+work_df = raw_df.copy()
+work_df[dt_col] = pd.to_datetime(work_df[dt_col], errors="coerce")
+work_df = work_df.dropna(subset=[dt_col])
+work_df = work_df.sort_values(dt_col)
 
-# Analisis tren waktu jika ada timestamp
-if timestamp_col:
-    st.header('📈 Tren Kualitas Udara dari Waktu ke Waktu')
-    
-    # Pilihan agregasi
-    aggregation = st.selectbox('Pilih Agregasi Waktu', ['Harian', 'Mingguan', 'Bulanan', 'Tahunan'])
-    
-    freq_map = {'Harian': 'D', 'Mingguan': 'W', 'Bulanan': 'M', 'Tahunan': 'Y'}
-    freq = freq_map[aggregation]
-    
-    # Agregasi data
-    aggregated_data = data.groupby(pd.Grouper(key=timestamp_col, freq=freq))[selected_pollutant].mean().reset_index()
-    aggregated_data = aggregated_data.dropna()  # Hapus nilai NaN
-    
-    if not aggregated_data.empty:
-        # Hitung perubahan tren
-        first_value = aggregated_data[selected_pollutant].iloc[0]
-        last_value = aggregated_data[selected_pollutant].iloc[-1]
-        trend_change = ((last_value - first_value) / first_value) * 100
-        
-        st.metric(
-            label=f"Perubahan Tren {aggregation}",
-            value=f"{last_value:.2f}",
-            delta=f"{trend_change:.1f}%",
-            delta_color="inverse" if trend_change > 0 else "normal"
+if clip_outliers and pollutant_cols:
+    work_df = robust_clip(work_df, pollutant_cols)
+
+# ============= PERTANYAAN 1: Statistik Deskriptif =============
+st.subheader("Pertanyaan 1: Statistik Deskriptif Polutan")
+if not pollutant_cols:
+    st.warning("Pilih minimal satu kolom polutan di sidebar.")
+else:
+    stats_df = descriptive_stats(work_df, pollutant_cols)
+    st.dataframe(stats_df.style.format({
+        "Mean": "{:.3f}", "Median": "{:.3f}", "StdDev": "{:.3f}", "Min": "{:.3f}", "Max": "{:.3f}",
+        "N": "{:.0f}", "Missing": "{:.0f}",
+    }))
+    download_csv_button(stats_df.reset_index().rename(columns={"index": "Polutan"}), "descriptive_stats.csv", "⬇️ Unduh Statistik Deskriptif")
+
+# ============= PERTANYAAN 2: Tren Kualitas Udara =============
+st.subheader("Pertanyaan 2: Tren Konsentrasi dari Waktu ke Waktu")
+if pollutant_cols:
+    # Use formatted date for plotting
+    plot_dt_col = dt_col if 'tanggal' in dt_col else f"{dt_col}_tanggal"
+    rdf = resample_df(work_df, plot_dt_col, pollutant_cols, freq)
+    # rolling mean
+    roll_df = rdf.copy()
+    for c in pollutant_cols:
+        roll_df[c] = roll_df[c].rolling(window=roll_window, min_periods=1).mean()
+
+    # pilih polutan untuk grafik
+    sel_pol = st.multiselect("Pilih polutan untuk grafik", pollutant_cols, default=pollutant_cols[: min(3, len(pollutant_cols))])
+
+    tab1, tab2 = st.tabs(["📈 Tren (Mean)", "📉 Tren (Rolling Mean)"])
+
+    with tab1:
+        if sel_pol:
+            plot_df = rdf.melt(
+                id_vars=[plot_dt_col], 
+                value_vars=sel_pol, 
+                var_name="Polutan", 
+                value_name="Konsentrasi"
+            )
+            fig = px.line(plot_df, x=plot_dt_col, y="Konsentrasi", 
+                         color="Polutan", markers=True)
+            fig.update_layout(
+                margin=dict(l=0, r=0, t=10, b=0),
+                xaxis_title="Tanggal",
+                yaxis_title="Konsentrasi"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            download_csv_button(rdf[[plot_dt_col] + sel_pol], f"tren_{freq_label.lower()}.csv", "⬇️ Unduh Data Tren")
+        else:
+            st.info("Pilih polutan untuk menampilkan grafik.")
+
+    with tab2:
+        if sel_pol:
+            plot_df2 = roll_df.melt(id_vars=[plot_dt_col], value_vars=sel_pol, var_name="Polutan", value_name="Konsentrasi (Rolling)")
+            fig2 = px.line(plot_df2, x=plot_dt_col, y="Konsentrasi (Rolling)", color="Polutan")
+            fig2.update_layout(margin=dict(l=0, r=0, t=10, b=0))
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.info("Pilih polutan untuk menampilkan grafik.")
+
+    # ringkasan tren dan arah
+    rdf[dt_col] = pd.to_datetime(rdf[dt_col])
+    tsum = trend_summary(rdf, dt_col, pollutant_cols)
+    if not tsum.empty:
+        st.markdown("**Ringkasan Tren per Polutan** (berdasarkan agregasi yang dipilih)")
+        st.dataframe(tsum.style.format({
+            "Rata-rata": "{:.3f}", "Median": "{:.3f}", "Slope_per_hari": "{:.4f}", "%Perubahan (first→last)": "{:.2f}%",
+        }))
+
+        # simpulan keseluruhan
+        dir_counts = tsum["Arah"].value_counts()
+        naik = int(dir_counts.get("Naik", 0))
+        turun = int(dir_counts.get("Turun", 0))
+        stagnan = int(dir_counts.get("Stagnan", 0))
+        st.success(
+            f"**Simpulan singkat**: Dari {len(tsum)} polutan terpilih, {naik} menunjukkan kecenderungan naik, {turun} turun, dan {stagnan} relatif stagnan pada tingkat agregasi **{freq_label.lower()}**."
         )
-        
-        # Plot tren
-        fig_trend = px.line(aggregated_data, x=timestamp_col, y=selected_pollutant,
-                           title=f'Tren {selected_pollutant} ({aggregation})',
-                           labels={timestamp_col: 'Waktu', selected_pollutant: 'Konsentrasi'})
-        st.plotly_chart(fig_trend)
-        
-        # Tampilkan data agregat
-        with st.expander("Lihat Data Agregat"):
-            st.dataframe(aggregated_data)
-    else:
-        st.warning("Tidak ada data yang cukup untuk analisis tren.")
-else:
-    st.warning("⚠️ Tidak ditemukan kolom timestamp untuk analisis tren waktu.")
 
-# Analisis korelasi antar polutan
-st.header('🔗 Korelasi Antar Polutan')
-if len(numeric_columns) > 1:
-    correlation_matrix = data[numeric_columns].corr()
-    
-    fig_corr = px.imshow(correlation_matrix,
-                        title='Matriks Korelasi Antar Polutan',
-                        color_continuous_scale='RdBu_r',
-                        aspect="auto")
-    st.plotly_chart(fig_corr)
-    
-    # Tampilkan korelasi terkuat
-    st.subheader('Korelasi Terkuat')
-    correlations = []
-    for i in range(len(numeric_columns)):
-        for j in range(i+1, len(numeric_columns)):
-            corr_value = correlation_matrix.iloc[i, j]
-            correlations.append((numeric_columns[i], numeric_columns[j], corr_value))
-    
-    # Urutkan berdasarkan absolute value
-    correlations.sort(key=lambda x: abs(x[2]), reverse=True)
-    
-    for i, (col1, col2, corr) in enumerate(correlations[:3]):
-        st.write(f"{i+1}. {col1} vs {col2}: {corr:.3f}")
-else:
-    st.info("Minimal 2 polutan diperlukan untuk analisis korelasi.")
-
-# Download data hasil analisis
-st.header('📥 Ekspor Data')
-if st.button('Download Statistik Deskriptif sebagai CSV'):
-    stats_all.to_csv('statistik_polutan.csv')
-    st.success('File statistik_polutan.csv berhasil diunduh!')
-
-# Footer
-st.markdown('---')
-st.caption('Dashboard Analisis Kualitas Udara | Data sumber: main_data.csv | Dibuat dengan Streamlit')
+# ====== FOOTER ======
+st.divider()
+st.caption(
+    "Catatan: Slope dihitung via regresi linear sederhana (unit per hari) pada seri agregat. %Perubahan dihitung dari periode pertama ke terakhir. Gunakan opsi winsorize untuk mereduksi pengaruh outlier ekstrem."
+)
