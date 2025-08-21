@@ -15,8 +15,8 @@ st.markdown('---')
 def load_data():
     """Load data dari main_data.csv dengan parsing datetime otomatis."""
     try:
-        data = pd.read_csv('PRSA_Data_Dongsi_20130301-20170228.csv')
-        st.success("✅ Data berhasil dimuat dari PRSA_Data_Dongsi_20130301-20170228.csv")
+        data = pd.read_csv('main_data.csv')
+        st.success("✅ Data berhasil dimuat dari main_data.csv")
         
         # Daftar kolom yang mungkin berisi tanggal/waktu
         date_columns = ['timestamp', 'datetime', 'date', 'time', 'tanggal', 'waktu']
